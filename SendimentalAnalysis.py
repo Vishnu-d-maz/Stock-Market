@@ -1,144 +1,178 @@
-from flask import Flask, render_template_string, request, jsonify
+# =====================================================
+# SINGLE-FILE KITE INTRADAY DASHBOARD – 5-MIN PREDICTIONS
+# Fully integrated with auto-login, access token, and explainable predictions
+# =====================================================
+
+from flask import Flask, redirect, request, jsonify, render_template_string
+from kiteconnect import KiteConnect
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import feedparser
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 from datetime import datetime, timedelta
-import time
+import webbrowser, threading
+
+# =====================
+# KITE CONFIG (FILL THESE)
+# =====================
+API_KEY = "0x1niqzaa6tvxuid"
+API_SECRET = "974md4plu221gr0xislzf3h4f9v15t1e"
+REDIRECT_URL = "http://127.0.0.1:8000/callback"
+
+kite = KiteConnect(api_key=API_KEY)
+access_token = None
 
 app = Flask(__name__)
 
-# Cache dictionary: {symbol: (timestamp, sentiment)}
-sentiment_cache = {}
-
+# =====================
+# DASHBOARD HTML
+# =====================
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Live Stock Dashboard</title>
-    <style>
-        body { font-family: Arial; background: #f4f6f8; padding: 30px; }
-        .card { background: white; padding: 20px; border-radius: 10px; width: 520px; margin: auto; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        h1 { text-align: center; }
-        .buy { color: green; font-weight: bold; }
-        .sell { color: red; font-weight: bold; }
-        select { padding: 6px; width: 100%; margin-bottom: 10px; }
-    </style>
-    <script>
-        function fetchData() {
-            const symbol = document.getElementById("symbol").value;
-            fetch("/update?symbol=" + symbol)
-            .then(response => response.json())
-            .then(data => {
-                if(data.error){ alert(data.error); return; }
-                document.getElementById("date").innerText = data.date;
-                document.getElementById("price").innerText = data.price;
-                document.getElementById("sentiment").innerText = data.sentiment;
-                document.getElementById("confidence").innerText = data.confidence + "%";
-                document.getElementById("signal").innerText = data.signal;
-                document.getElementById("signal").className = data.css;
-            });
-        }
-        setInterval(fetchData, 60000); // every 60 seconds
-        window.onload = fetchData;
-    </script>
+  <title>Kite 5-min Intraday Dashboard</title>
+  <style>
+    body { font-family: Arial; background:#f4f6f8; padding:30px; }
+    .card { background:#fff; padding:20px; border-radius:10px; width:720px; margin:auto; box-shadow:0 0 10px rgba(0,0,0,.1); }
+    .buy { color:green; font-weight:bold; }
+    .sell { color:red; font-weight:bold; }
+    select { padding:6px; width:100%; margin-bottom:10px; }
+  </style>
+  <script>
+    function fetchData(){
+      const s=document.getElementById('symbol').value;
+      fetch('/update?symbol='+s).then(r=>r.json()).then(d=>{
+        if(d.error){ alert(d.error); return; }
+        date.innerText=d.date; price.innerText=d.price;
+        rsi.innerText=d.rsi; ma5.innerText=d.ma5; ma10.innerText=d.ma10;
+        confidence.innerText=d.confidence+'%';
+        signal.innerText=d.signal; signal.className=d.css;
+        const ul=document.getElementById('why'); ul.innerHTML='';
+        d.why.forEach(x=>{const li=document.createElement('li'); li.innerText=x; ul.appendChild(li);});
+      });
+    }
+    setInterval(fetchData,60000); window.onload=fetchData;
+  </script>
 </head>
 <body>
-<div class="card">
-    <h1>📈 Live Stock Dashboard</h1>
-    <form>
-        <select id="symbol" onchange="fetchData()">
-            <option value="AAPL">Apple (AAPL)</option>
-            <option value="TSLA">Tesla (TSLA)</option>
-            <option value="MSFT">Microsoft (MSFT)</option>
-        </select>
-    </form>
+  <div class="card">
+    <h2>📈 Kite 5-min Intraday Dashboard</h2>
+    <select id="symbol" onchange="fetchData()">
+      <option value="RELIANCE">RELIANCE</option>
+      <option value="TCS">TCS</option>
+      <option value="INFY">INFY</option>
+    </select>
     <p><b>Date:</b> <span id="date"></span></p>
-    <p><b>Close Price:</b> <span id="price"></span></p>
-    <p><b>Sentiment (VADER):</b> <span id="sentiment"></span></p>
+    <p><b>Last Price:</b> <span id="price"></span></p>
+    <p><b>RSI:</b> <span id="rsi"></span></p>
+    <p><b>MA5:</b> <span id="ma5"></span></p>
+    <p><b>MA10:</b> <span id="ma10"></span></p>
     <p><b>Confidence:</b> <span id="confidence"></span></p>
     <p><b>Prediction:</b> <span id="signal"></span></p>
-</div>
+    <h3>Why this decision?</h3>
+    <ul id="why"></ul>
+  </div>
 </body>
 </html>
 """
 
-# Function to get live sentiment
-def get_sentiment(symbol):
-    now = time.time()
-    if symbol in sentiment_cache:
-        ts, cached_sentiment = sentiment_cache[symbol]
-        if now - ts < 120:  # cache for 2 minutes
-            return cached_sentiment
-
-    news_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
-    feed = feedparser.parse(news_url)
-    analyzer = SentimentIntensityAnalyzer()
-
-    if not feed.entries:
-        avg_sentiment = 0.0
+# =====================
+# EXPLAIN LOGIC
+# =====================
+def explain_decision(row, confidence, signal):
+    reasons=[]
+    if signal=='BUY':
+        if row['rsi']<30: reasons.append('RSI indicates oversold conditions')
+        if row['ma5']>row['ma10']: reasons.append('Uptrend detected (MA5 > MA10)')
+        if confidence>60: reasons.append('Model confidence is high')
     else:
-        sentiments = [analyzer.polarity_scores(e.title)['compound'] for e in feed.entries[:20]]
-        avg_sentiment = sum(sentiments)/len(sentiments)
+        if row['rsi']>70: reasons.append('RSI indicates overbought conditions')
+        if row['ma5']<row['ma10']: reasons.append('Downtrend detected (MA5 < MA10)')
+    if not reasons: reasons.append('Decision based on mixed signals')
+    return reasons
 
-    sentiment_cache[symbol] = (now, avg_sentiment)
-    return avg_sentiment
+# =====================
+# ROUTES
+# =====================
+@app.route('/')
+def start():
+    return redirect(kite.login_url())
 
-@app.route("/")
-def index():
+@app.route('/callback')
+def callback():
+    global access_token
+    rt=request.args.get('request_token')
+    if not rt: return 'ERROR: request_token missing'
+    data=kite.generate_session(rt, api_secret=API_SECRET)
+    access_token=data['access_token']
+    kite.set_access_token(access_token)
+    return redirect('/dashboard')
+
+@app.route('/dashboard')
+def dashboard():
+    if not access_token: return redirect('/')
     return render_template_string(HTML)
 
-@app.route("/update")
+@app.route('/update')
 def update():
-    symbol = request.args.get("symbol", "AAPL")
+    if not access_token: return jsonify({'error':'Not authenticated'})
 
-    # 1. Fetch stock data
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=30)
-    stock = yf.download(symbol, start=start_date, end=end_date, auto_adjust=False, progress=False, threads=False)
-    if stock.empty:
-        return jsonify({"error":"No stock data available"})
+    symbol=request.args.get('symbol','RELIANCE')
+    inst=[i for i in kite.instruments('NSE') if i['tradingsymbol']==symbol]
+    if not inst: return jsonify({'error':'Symbol not found'})
+    token=inst[0]['instrument_token']
 
-    stock.reset_index(inplace=True)
-    stock.columns = stock.columns.get_level_values(0)  # flatten multi-index if exists
+    # Fetch last 10 days intraday 5-min bars
+    to_dt=datetime.now()
+    from_dt=to_dt - timedelta(days=10)
+    data=kite.historical_data(token, from_dt, to_dt, interval='5minute')
+    df=pd.DataFrame(data)
+    if df.empty or len(df)<20: return jsonify({'error':'Not enough data'})
 
-    latest_price = round(stock.iloc[-1]['Close'], 2)
-    date_str = pd.to_datetime(stock['Date'].iloc[-1]).strftime('%Y-%m-%d')
+    # Indicators
+    df['return']=df['close'].pct_change()
+    df['ma5']=df['close'].rolling(5).mean()
+    df['ma10']=df['close'].rolling(10).mean()
+    d=df['close'].diff(); g=d.clip(lower=0).rolling(14).mean(); l=(-d.clip(upper=0)).rolling(14).mean()
+    rs=g/l; df['rsi']=100-(100/(1+rs))
+    df['vol_change']=df['volume'].pct_change()
+    df['target']=(df['close'].shift(-1)>df['close']).astype(int)
 
-    # 2. Get sentiment
-    sentiment = round(get_sentiment(symbol),3)
+    df.dropna(inplace=True)
+    if df.empty: return jsonify({'error':'Insufficient valid data'})
 
-    # 3. Model prediction
-    stock['target'] = (stock['Close'] > stock['Open']).astype(int)
-    X = stock[['Open','Volume']]
-    y = stock['target']
+    # Model
+    X=df[['return','ma5','ma10','rsi','vol_change']]; y=df['target']
+    model=Pipeline([('scaler',StandardScaler()),('lr',LogisticRegression(max_iter=500))])
+    model.fit(X[:-1],y[:-1])
 
-    if len(X) < 5:
-        return jsonify({"error":"Not enough data to train model"})
+    latest=X.iloc[[-1]]
+    prob=model.predict_proba(latest)[0]; pred=np.argmax(prob)
+    confidence=round(max(prob)*100,2)
+    signal='BUY' if pred==1 else 'SELL'; css='buy' if signal=='BUY' else 'sell'
 
-    model = LogisticRegression(max_iter=200)
-    model.fit(X[:-1], y[:-1])
-
-    latest = X.iloc[[-1]]
-    prob = model.predict_proba(latest)[0]
-    prediction = np.argmax(prob)
-    confidence = round(max(prob)*100,2)
-    signal = "BUY" if prediction==1 else "SELL"
-    css = "buy" if signal=="BUY" else "sell"
-
-    # Debug output (optional)
-    print(f"{symbol}: price={latest_price}, sentiment={sentiment}, confidence={confidence}, signal={signal}")
+    row=df.iloc[-1]
+    why=explain_decision(row, confidence, signal)
 
     return jsonify({
-        "date": date_str,
-        "price": latest_price,
-        "sentiment": sentiment,
-        "confidence": confidence,
-        "signal": signal,
-        "css": css
+        'date': row['date'].strftime('%Y-%m-%d %H:%M'),
+        'price': round(row['close'],2),
+        'rsi': round(row['rsi'],2),
+        'ma5': round(row['ma5'],2),
+        'ma10': round(row['ma10'],2),
+        'confidence': confidence,
+        'signal': signal,
+        'css': css,
+        'why': why
     })
 
-if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8000, debug=False, use_reloader=False)
+# =====================
+# RUN
+# =====================
+def open_browser(): webbrowser.open('http://127.0.0.1:8000')
+
+if __name__=='__main__':
+    threading.Timer(1, open_browser).start()
+    app.run(host='127.0.0.1', port=8000, debug=False, use_reloader=False)
